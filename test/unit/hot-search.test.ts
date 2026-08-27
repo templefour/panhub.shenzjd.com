@@ -81,7 +81,7 @@ describe("HotSearchService (Turso store, local file::memory:)", () => {
     expect(stats.mode).toBe("turso");
   });
 
-  it("应该过滤违规词", async () => {
+  it("不限制用户搜索内容（2026-08-22 用户拍板：敏感词过滤已移除）", async () => {
     await service.clearHotSearches();
     await service.recordSearch("政治敏感词");
     await service.recordSearch("暴力内容");
@@ -89,10 +89,9 @@ describe("HotSearchService (Turso store, local file::memory:)", () => {
     await service.flush();
 
     const searches = await service.getHotSearches(50);
-    const hasForbidden = searches.some(
-      (s) => s.term.includes("政治") || s.term.includes("暴力")
-    );
-    expect(hasForbidden).toBe(false);
+    // 用户搜什么就记录什么，不再过滤
+    expect(searches.some((s) => s.term === "政治敏感词")).toBe(true);
+    expect(searches.some((s) => s.term === "暴力内容")).toBe(true);
     expect(searches.some((s) => s.term === "正常搜索词")).toBe(true);
   });
 
@@ -132,13 +131,13 @@ describe("HotSearchService (Turso store, local file::memory:)", () => {
     expect(searches.length).toBe(0);
   });
 
-  it("应该处理超长搜索词", async () => {
+  it("超长搜索词现在允许记录（2026-08-22 用户拍板：不限制搜索内容）", async () => {
     await service.clearHotSearches();
     await service.recordSearch("a".repeat(101));
     await service.flush();
 
     const searches = await service.getHotSearches(100);
-    expect(searches.length).toBe(0);
+    expect(searches.some((s) => s.term === "a".repeat(101))).toBe(true);
   });
 
   it("应该返回今日随机热搜词（service 层转发冒烟）", async () => {
@@ -153,5 +152,148 @@ describe("HotSearchService (Turso store, local file::memory:)", () => {
       expect(typeof s.term).toBe("string");
       expect(s.term.length).toBeGreaterThan(0);
     }
+  });
+
+  it("应该返回历史累计搜索总次数（service 层转发冒烟）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("总量词A");
+    await service.recordSearch("总量词A");
+    await service.recordSearch("总量词B");
+    await service.flush();
+
+    const total = await service.getTotalSearches();
+    // 词A count=2 + 词B count=1 = 3
+    expect(total).toBe(3);
+  });
+
+  it("flush 时按日期精确聚合写入 daily_searches（部署起计数）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("日词A");
+    await service.recordSearch("日词A");
+    await service.recordSearch("日词B");
+    await service.flush();
+
+    const today = new Date(Date.now() + 8 * 3600 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const todayKey = `${today.getUTCFullYear()}-${pad(today.getUTCMonth() + 1)}-${pad(today.getUTCDate())}`;
+
+    // 今日精确次数：词A 2 次 + 词B 1 次 = 3
+    expect(await service.getDailySearches(todayKey)).toBe(3);
+  });
+
+  it("应该返回词库累计词数（service 层转发冒烟）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("词数A");
+    await service.recordSearch("词数B");
+    await service.recordSearch("词数A"); // 同词合并
+    await service.flush();
+
+    expect(await service.getTotalTerms()).toBe(2);
+  });
+});
+
+describe("HotSearchService 读缓存", () => {
+  let service: HotSearchService;
+  let resetHotSearchService: () => void;
+
+  beforeAll(async () => {
+    process.env.TURSO_URL = "file::memory:";
+    delete process.env.TURSO_AUTH_TOKEN;
+    const mod = await import("../../server/core/services/hotSearchService");
+    resetHotSearchService = mod.resetHotSearchService;
+    service = mod.getOrCreateHotSearchService();
+    await service.clearHotSearches();
+  });
+
+  afterAll(() => {
+    resetHotSearchService();
+    delete process.env.TURSO_URL;
+  });
+
+  it("首次读取查库并写入缓存，TTL 内重复读取命中（不再查库）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("缓存词A");
+    await service.flush();
+
+    // 首次读取：缓存 miss → 查库 → 写入缓存
+    const first = await service.getHotSearches(10);
+    expect(first.some((s) => s.term === "缓存词A")).toBe(true);
+    const cacheAfterFirst = (service as any).readCache as Map<string, { value: unknown; expires: number }>;
+    expect(cacheAfterFirst.has("hot:10")).toBe(true);
+
+    // 二次读取：TTL 内命中缓存，缓存条目数不增加（未再查库）
+    const cacheSizeBefore = cacheAfterFirst.size;
+    const second = await service.getHotSearches(10);
+    expect(second).toEqual(first);
+    expect(cacheAfterFirst.size).toBe(cacheSizeBefore);
+    expect(cacheAfterFirst.get("hot:10")).toBeDefined();
+  });
+
+  it("词云随机抽样同样走缓存（60s 内结果稳定）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("词云缓存词");
+    await service.flush();
+
+    const a = await service.getRandomHotSearches(25);
+    const cache = (service as any).readCache as Map<string, unknown>;
+    expect(cache.has("random:25")).toBe(true);
+    const b = await service.getRandomHotSearches(25);
+    expect(b).toEqual(a);
+  });
+
+  it("deleteHotSearch 后读缓存立即失效（被删词不再出现）", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("待删缓存词");
+    await service.flush();
+
+    // 先读一次填充缓存
+    const before = await service.getHotSearches(50);
+    expect(before.some((s) => s.term === "待删缓存词")).toBe(true);
+    expect(((service as any).readCache as Map<string, unknown>).size).toBeGreaterThan(0);
+
+    // 删除后缓存清空，再读走查库 → 不含被删词
+    await service.deleteHotSearch("待删缓存词");
+    expect(((service as any).readCache as Map<string, unknown>).size).toBe(0);
+    const after = await service.getHotSearches(50);
+    expect(after.some((s) => s.term === "待删缓存词")).toBe(false);
+  });
+
+  it("clearHotSearches 清空读缓存", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("清空缓存词");
+    await service.flush();
+    await service.getHotSearches(10); // 填充缓存
+    expect(((service as any).readCache as Map<string, unknown>).size).toBeGreaterThan(0);
+
+    await service.clearHotSearches();
+    expect(((service as any).readCache as Map<string, unknown>).size).toBe(0);
+  });
+
+  it("flush 成功后清「按日期聚合」缓存(calendar/day/daily)，但保留首页 hot/random 缓存", async () => {
+    await service.clearHotSearches();
+    await service.recordSearch("flush前词");
+    await service.flush(); // flush 后缓存空
+
+    // 填充三类缓存：日期聚合(calendar/day/daily) + 首页(hot/random)
+    await service.getCalendar(30);
+    await service.getDayItems("2026-08-25");
+    await service.getDailySearches("2026-08-25");
+    await service.getHotSearches(10);
+    await service.getRandomHotSearches(25);
+    const cache = (service as any).readCache as Map<string, unknown>;
+    expect(cache.has("calendar:30")).toBe(true);
+    expect(cache.has("day:2026-08-25")).toBe(true);
+    expect(cache.has("daily:2026-08-25")).toBe(true);
+    expect(cache.has("hot:10")).toBe(true);
+    expect(cache.has("random:25")).toBe(true);
+
+    // 新搜索再次 flush：日期聚合键应被清空，首页缓存保留（避免高频读次数徒增）
+    await service.recordSearch("flush后新词");
+    await service.flush();
+    expect(cache.has("calendar:30")).toBe(false);
+    expect(cache.has("day:2026-08-25")).toBe(false);
+    expect(cache.has("daily:2026-08-25")).toBe(false);
+    expect(cache.has("hot:10")).toBe(true); // 保留
+    expect(cache.has("random:25")).toBe(true); // 保留
   });
 });

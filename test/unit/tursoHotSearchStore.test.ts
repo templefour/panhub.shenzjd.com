@@ -77,15 +77,21 @@ describe("TursoHotSearchStore", () => {
     expect(item?.score).toBe(2);
   });
 
-  it("过滤非法词条（URL/敏感词/空串/超长）", async () => {
+  it("空串丢弃，其余全部记录（2026-08-22 用户拍板：不限制搜索内容）", async () => {
     const now = Date.now();
+    // URL / 超长 / 敏感词均允许记录
     await store.recordSearch("https://example.com", now);
-    await store.recordSearch("赌博网站", now);
-    await store.recordSearch("   ", now);
     await store.recordSearch("a".repeat(21), now);
+    await store.recordSearch("赌博网站", now);
+    // 空串仍丢弃
+    await store.recordSearch("   ", now);
 
     const hot = await store.getHotSearches(10);
-    expect(hot.length).toBe(0);
+    const terms = hot.map((s) => s.term);
+    expect(terms).toContain("https://example.com");
+    expect(terms).toContain("a".repeat(21));
+    expect(terms).toContain("赌博网站");
+    expect(terms).not.toContain("");
   });
 
   it("全角转半角规范化", async () => {
@@ -156,6 +162,64 @@ describe("TursoHotSearchStore", () => {
     const items = await store.getDayItems(today);
     expect(items.length).toBe(2);
     expect(items[0]).toEqual({ term: "日词2", rank: 1, count: 2 });
+  });
+
+  it("getTotalSearches 返回历史累计搜索总次数（全表 SUM(count)）", async () => {
+    const now = Date.now();
+    await store.recordSearch("词A", now, 3);
+    await store.recordSearch("词B", now, 2);
+    await store.recordSearch("词C", now, 5);
+    await store.recordSearch("词A", now, 4); // 累计 count 合并：词A 3+4=7
+
+    const total = await store.getTotalSearches();
+    expect(total).toBe(7 + 2 + 5); // 14
+  });
+
+  it("getTotalSearches 空库返回 0", async () => {
+    expect(await store.getTotalSearches()).toBe(0);
+  });
+
+  it("getTotalTerms 返回词库累计词数（全表 COUNT(*)）", async () => {
+    const now = Date.now();
+    await store.recordSearch("词A", now);
+    await store.recordSearch("词B", now);
+    await store.recordSearch("词C", now);
+    await store.recordSearch("词A", now); // 同词不新增行
+
+    expect(await store.getTotalTerms()).toBe(3);
+  });
+
+  it("getTotalTerms 空库返回 0", async () => {
+    expect(await store.getTotalTerms()).toBe(0);
+  });
+
+  it("recordDailySearches 精确累加指定日期搜索次数（部署起计数）", async () => {
+    await store.recordDailySearches("2026-08-22", 5);
+    await store.recordDailySearches("2026-08-22", 3);
+    await store.recordDailySearches("2026-08-21", 2);
+
+    expect(await store.getDailySearches("2026-08-22")).toBe(8);
+    expect(await store.getDailySearches("2026-08-21")).toBe(2);
+    expect(await store.getDailySearches("2026-08-20")).toBe(0);
+  });
+
+  it("getDailySearchesDayCount 统计有记录的天数", async () => {
+    expect(await store.getDailySearchesDayCount()).toBe(0);
+    await store.recordDailySearches("2026-08-20", 1);
+    await store.recordDailySearches("2026-08-21", 1);
+    await store.recordDailySearches("2026-08-22", 1);
+    expect(await store.getDailySearchesDayCount()).toBe(3);
+  });
+
+  it("clearHotSearches 同时清空 daily_searches", async () => {
+    const now = Date.now();
+    await store.recordSearch("清空词", now);
+    await store.recordDailySearches("2026-08-22", 10);
+
+    await store.clearHotSearches();
+    expect((await store.getHotSearches(10)).length).toBe(0);
+    expect(await store.getDailySearches("2026-08-22")).toBe(0);
+    expect(await store.getDailySearchesDayCount()).toBe(0);
   });
 
   it("deleteHotSearch 删除与容错", async () => {

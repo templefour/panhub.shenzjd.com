@@ -1,7 +1,7 @@
 import { createClient, type Client } from "@libsql/client";
 import type { IHotSearchStore, HotSearchItem, HotSearchStats, TopTerm, DaySnapshot, DayTerm } from "./hotSearchStore";
 import { loggers } from "../utils/logger";
-import { normalize, isForbidden, formatDateKey, beijingDayStart } from "./hotSearchUtils";
+import { normalize, formatDateKey, beijingDayStart } from "./hotSearchUtils";
 
 /**
  * Turso 热搜存储实现（libSQL / SQLite fork，HTTP 驱动）
@@ -55,6 +55,11 @@ export class TursoHotSearchStore implements IHotSearchStore {
       )`,
       "CREATE INDEX IF NOT EXISTS idx_search_terms_last ON search_terms(last_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_search_terms_count ON search_terms(count DESC)",
+      // 每日搜索次数精确表（2026-08-22 用户拍板：从部署起记录，攒满一周再展示）
+      `CREATE TABLE IF NOT EXISTS daily_searches (
+        date TEXT PRIMARY KEY,
+        searches INTEGER NOT NULL DEFAULT 0
+      )`,
     ]);
     // hot_searches 表已废弃（2026-08-18）：生产 API 全部只读 search_terms，
     // 热搜写入只落 search_terms 一张表（原双表每次搜索写 2 行 → 1 行，省一半写入配额）
@@ -75,29 +80,18 @@ export class TursoHotSearchStore implements IHotSearchStore {
     await this.waitForInit();
     const normalized = normalize(term);
     if (!normalized) return;
-    if (isForbidden(normalized)) return;
     const d = Math.max(1, delta);
 
-    // 全量词库表：每次搜索 count + d、更新 last_at（hot_searches 表已废弃，只写这一张）
-    const termRow = (
-      await this.client.execute(
-        "SELECT count FROM search_terms WHERE term = ?",
-        [normalized]
-      )
-    ).rows[0];
-    if (termRow) {
-      await this.client.execute(
-        "UPDATE search_terms SET count = count + ?, last_at = ? WHERE term = ?",
-        [d, now, normalized]
-      );
-      loggers.hotSearch.info("搜索词", { term: normalized, isNew: false });
-    } else {
-      await this.client.execute(
-        "INSERT INTO search_terms (term, count, first_at, last_at) VALUES (?, ?, ?, ?)",
-        [normalized, d, now, now]
-      );
-      loggers.hotSearch.info("搜索词", { term: normalized, isNew: true });
-    }
+    // 原子 upsert（2026-08-27 优化：消除 SELECT-then-UPDATE 两段式，
+    // 每次 flush 往返数减半；与 tursoBotDefenseStore.recordRejection 写法统一）
+    await this.client.execute(
+      `INSERT INTO search_terms (term, count, first_at, last_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(term) DO UPDATE SET
+         count = count + excluded.count,
+         last_at = excluded.last_at`,
+      [normalized, d, now, now]
+    );
   }
 
   /**
@@ -130,19 +124,28 @@ export class TursoHotSearchStore implements IHotSearchStore {
     await this.waitForInit();
     const dayStart = beijingDayStart(formatDateKey(Date.now()));
     const safeLimit = Math.min(Math.max(1, limit), 100);
+    // 2026-08-27 优化：去掉 ORDER BY RANDOM() 全表扫，
+    // 改为走索引 idx_search_terms_last 取候选池，内存 shuffle 后截取
+    const candidateLimit = Math.min(safeLimit * 4, 400);
     const rows = (
       await this.client.execute(
         `SELECT term, count, first_at, last_at FROM search_terms
          WHERE last_at >= ?
-         ORDER BY RANDOM()
+         ORDER BY last_at DESC
          LIMIT ?`,
-        [dayStart, safeLimit]
+        [dayStart, candidateLimit]
       )
     ).rows;
 
+    // Fisher-Yates 内存 shuffle，保证每次刷新有新鲜感
+    for (let i = rows.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rows[i], rows[j]] = [rows[j], rows[i]];
+    }
+    const picked = rows.slice(0, safeLimit);
+
     const out: HotSearchItem[] = [];
-    for (const obj of rows) {
-      if (isForbidden(obj.term as string)) continue;
+    for (const obj of picked) {
       out.push({
         term: obj.term as string,
         score: obj.count as number,
@@ -161,7 +164,10 @@ export class TursoHotSearchStore implements IHotSearchStore {
 
   async clearHotSearches(): Promise<{ success: boolean; message: string }> {
     await this.waitForInit();
-    await this.client.execute("DELETE FROM search_terms");
+    await this.client.batch([
+      "DELETE FROM search_terms",
+      "DELETE FROM daily_searches",
+    ]);
     return { success: true, message: "热搜记录已清除" };
   }
 
@@ -274,6 +280,84 @@ export class TursoHotSearchStore implements IHotSearchStore {
       rank: index + 1,
       count: obj.count as number,
     }));
+  }
+
+  async getTotalSearches(): Promise<number> {
+    await this.waitForInit();
+    const row = (
+      await this.client.execute("SELECT COALESCE(SUM(count), 0) as s FROM search_terms")
+    ).rows[0];
+    return (row?.s ?? 0) as number;
+  }
+
+  async getTotalTerms(): Promise<number> {
+    await this.waitForInit();
+    const row = (
+      await this.client.execute("SELECT COUNT(*) as c FROM search_terms")
+    ).rows[0];
+    return (row?.c ?? 0) as number;
+  }
+
+  async recordDailySearches(date: string, delta: number): Promise<void> {
+    await this.waitForInit();
+    const d = Math.max(0, delta);
+    if (d === 0) return;
+    await this.client.execute(
+      `INSERT INTO daily_searches (date, searches) VALUES (?, ?)
+       ON CONFLICT(date) DO UPDATE SET searches = searches + excluded.searches`,
+      [date, d]
+    );
+  }
+
+  async getDailySearches(date: string): Promise<number> {
+    await this.waitForInit();
+    const row = (
+      await this.client.execute("SELECT searches as s FROM daily_searches WHERE date = ?", [date])
+    ).rows[0];
+    return (row?.s ?? 0) as number;
+  }
+
+  /**
+   * 范围查询 daily_searches（2026-08-25：日历"有次数显示次数"数据源）。
+   * 返回 Map<date, searches>，仅含已记录的天（未记录的天不在 map 中）。
+   */
+  async getDailySearchesRange(startTs: number, days: number): Promise<Map<string, number>> {
+    await this.waitForInit();
+    const rows = await this.client.execute(
+      `SELECT date, searches FROM daily_searches
+       WHERE date >= ? AND date <= ?
+       ORDER BY date`,
+      [formatDateKey(startTs), formatDateKey(startTs + days * 86400000)]
+    );
+    const map = new Map<string, number>();
+    for (const r of rows.rows) map.set(r.date as string, (r.searches as number) ?? 0);
+    return map;
+  }
+
+  async getDailySearchesDayCount(): Promise<number> {
+    await this.waitForInit();
+    const row = (
+      await this.client.execute("SELECT COUNT(DISTINCT date) as c FROM daily_searches")
+    ).rows[0];
+    return (row?.c ?? 0) as number;
+  }
+
+  /**
+   * 一次 batch 查 totalTerms + dailyDayCount（2026-08-27 优化：
+   * hot-calendar 原并行调两个方法 = 2 次 HTTP 往返，合并为 1 次 batch）
+   */
+  async getTotalTermsAndDailyDayCount(): Promise<{
+    totalTerms: number;
+    dailyDayCount: number;
+  }> {
+    await this.waitForInit();
+    const results = await this.client.batch([
+      "SELECT COUNT(*) as c FROM search_terms",
+      "SELECT COUNT(DISTINCT date) as c FROM daily_searches",
+    ]);
+    const totalTerms = ((results[0].rows[0]?.c as number) ?? 0);
+    const dailyDayCount = ((results[1].rows[0]?.c as number) ?? 0);
+    return { totalTerms, dailyDayCount };
   }
 
   close(): void {

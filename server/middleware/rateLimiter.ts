@@ -1,5 +1,6 @@
 import { defineEventHandler, getHeader, createError, setHeader } from "h3";
 import { isIP } from "node:net";
+import { getOrCreateBotDefenseService } from "../core/services/botDefense";
 
 /**
  * 全局限流中间件（IP 级，固定窗口）
@@ -34,6 +35,8 @@ const RATE_LIMITS: Record<string, { limit: number; windowMs: number }> = {
   // 探活每次最多 50 个链接 → 对上游请求放大 50x，需单独收紧防打爆网盘接口
   "/api/check": { limit: 15, windowMs: 60_000 },
   "/api/hot-searches": { limit: 30, windowMs: 60_000 },
+  // 频道配置下发（服务端/部署方拉取频道配置；限流防循环抓取）
+  "/api/channels": { limit: 120, windowMs: 60_000 },
 };
 
 const DEFAULT_LIMIT = { limit: 60, windowMs: 60_000 };
@@ -80,7 +83,7 @@ export function getClientIp(event: any): string {
 export function getRateLimit(pathname: string, limits: Record<string, { limit: number; windowMs: number }>, defaultLimit: { limit: number; windowMs: number }) {
   // 精确匹配
   if (limits[pathname]) return limits[pathname];
-  // 前缀匹配（/api/hot-searches POST 和 GET 共享限制）
+  // 前缀匹配（如 /api/hot-searches 各子路径共享限制）
   for (const [prefix, config] of Object.entries(limits)) {
     if (pathname.startsWith(prefix)) return config;
   }
@@ -137,6 +140,9 @@ export function createRateLimitMiddleware(config: RateLimitConfig = {}) {
     if (entry.count > limit) {
       const retryAfter = Math.ceil((entry.resetTime - now) / 1000);
       setHeader(event, "Retry-After", String(retryAfter));
+      // 累积到 IP 黑名单（异步、不阻塞 429 抛出）：单 IP 短时间内反复触发限流，
+      // 大概率是脚本/爬虫在试探阈值；与 UA 拦截共同构成两层证据
+      void getOrCreateBotDefenseService().recordRejection(ip, "rate_limit");
       throw createError({
         statusCode: 429,
         message: `请求过于频繁，请${retryAfter}秒后重试`,

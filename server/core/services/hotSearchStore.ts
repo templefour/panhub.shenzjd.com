@@ -52,6 +52,42 @@ export interface IHotSearchStore {
   getCalendar(days: number): Promise<DaySnapshot[]>;
 
   /**
+   * 获取历史累计搜索总次数（全表 SUM(count)）
+   * count 为每个词的累计搜索次数，全表求和即从建库以来所有搜索次数的总和。
+   */
+  getTotalSearches(): Promise<number>;
+
+  /**
+   * 获取词库累计词数（全表 COUNT(*)）
+   */
+  getTotalTerms(): Promise<number>;
+
+  /**
+   * 累加指定日期（北京时间 YYYY-MM-DD）的搜索次数（daily_searches 表，精确增量）
+   * 从部署起每次搜索 +delta，是"今日搜索次数"的可靠数据源（无历史回填，避免虚高）。
+   * @param date  北京时间日期键
+   * @param delta 该日期新增搜索次数（flush 聚合后的真实次数）
+   */
+  recordDailySearches(date: string, delta: number): Promise<void>;
+
+  /**
+   * 读取指定日期的搜索次数（daily_searches）；无记录返回 0
+   */
+  getDailySearches(date: string): Promise<number>;
+
+  /**
+   * 一次 batch 查 totalTerms + dailyDayCount（2026-08-27 优化：
+   * hot-calendar 原本并行调两个方法 = 2 次 HTTP 往返，合并为 1 次 batch）
+   */
+  getTotalTermsAndDailyDayCount(): Promise<{ totalTerms: number; dailyDayCount: number }>;
+
+  /**
+   * 搜索次数是否已积累足够（记录天数 >= minDays 才可展示，用户拍板：攒一星期再展示）
+   * 返回 daily_searches 中有记录的天数
+   */
+  getDailySearchesDayCount(): Promise<number>;
+
+  /**
    * 获取指定日期的全量词单
    */
   getDayItems(date: string): Promise<DayTerm[]>;

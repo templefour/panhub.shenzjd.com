@@ -69,7 +69,10 @@
           </span>
           <span v-if="searchState.paused" class="paused-indicator-bar">
             <span class="pause-icon">⏸</span>
-            <span class="paused-text">搜索已暂停</span>
+            <span v-if="autoPausedAtLimit" class="paused-text">
+              已找到 {{ searchState.total }} 条结果，可继续搜索更多
+            </span>
+            <span v-else class="paused-text">搜索已暂停</span>
           </span>
         </div>
 
@@ -125,7 +128,7 @@
       <div class="empty-card">
         <div class="empty-icon">🔍</div>
         <h3>未找到相关资源</h3>
-        <p>试试其他关键词，或检查设置中的搜索来源是否已启用</p>
+        <p>试试其他关键词，或稍后再试</p>
         <div v-if="hotTerms.length > 0" class="empty-suggestions">
           <span class="empty-suggestions__label">大家都在搜：</span>
           <button
@@ -157,6 +160,7 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from "vue";
 import { PLATFORM_INFO } from "~/config/plugins";
+import { isBotUA } from "~/utils/botUA";
 
 const config = useRuntimeConfig();
 const apiBase = (config.public?.apiBase as string) || "/api";
@@ -174,8 +178,14 @@ onMounted(async () => {
   // 从 URL 读取搜索关键词
   const q = route.query.q;
   if (q && typeof q === "string") {
-    kw.value = q;
-    await doSearch();
+    // 爬虫抓取 /?q=xxx（来自 sitemap）时不自动搜索：否则每次抓取都触发一次
+    // 完整搜索 + 记录热搜，形成自举循环。真人浏览器才自动搜索。
+    if (isBotUA(typeof navigator !== "undefined" ? navigator.userAgent : undefined)) {
+      kw.value = q; // 仍回填输入框，页面可读
+    } else {
+      kw.value = q;
+      await doSearch();
+    }
   }
   if (doubanHotRef.value) await doubanHotRef.value.init();
   if (hotSearchRef.value) await hotSearchRef.value.init();
@@ -186,17 +196,17 @@ onMounted(async () => {
 useSeoMeta({
   title: "PanHub - 全网最全的网盘搜索",
   description:
-    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，免费、快速、无广告。",
+    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，快速、高效。",
   ogTitle: "PanHub - 全网最全的网盘搜索",
   ogDescription:
-    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，免费、快速、无广告。",
+    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，快速、高效。",
   ogType: "website",
   ogSiteName: "PanHub",
   ogImage: siteUrl ? `${siteUrl}/og.svg` : "/og.svg",
   twitterCard: "summary_large_image",
   twitterTitle: "PanHub - 全网最全的网盘搜索",
   twitterDescription:
-    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，免费、快速、无广告。",
+    "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，快速、高效。",
   twitterImage: siteUrl ? `${siteUrl}/og.svg` : "/og.svg",
 });
 
@@ -261,10 +271,11 @@ const {
   pauseSearch,
   continueSearch,
   hasResults,
+  autoPausedAtLimit,
 } = useSearch();
 const { settings, loadSettings } = useSettings();
 const auth = useAuth();
-const { checkSearchAuth } = useWxAuth();
+const { checkSearchAuth, forceVerify } = useWxAuth();
 const requestUnlock = inject<(onSuccess?: () => void) => void>("requestUnlock");
 
 // 获取搜索选项（使用最新的用户设置）
@@ -273,21 +284,11 @@ function getSearchOptions() {
     apiBase,
     keyword: kw.value,
     settings: {
-      enabledPlugins: settings.value.enabledPlugins,
-      enabledTgChannels: settings.value.enabledTgChannels,
+      // 2026-08-25：插件/频道知识全在后端，前端设置只保留并发与超时
       concurrency: settings.value.concurrency,
       pluginTimeoutMs: settings.value.pluginTimeoutMs,
     },
   };
-}
-
-// 记录热搜词
-async function recordHotSearch(keyword: string) {
-  const term = keyword?.trim();
-  if (!term) return;
-  try {
-    await $fetch(`${apiBase}/hot-searches`, { method: "POST", body: { term } });
-  } catch (_e) {}
 }
 
 // 执行实际搜索逻辑（供 requestUnlock 回调复用）
@@ -295,26 +296,56 @@ async function doSearch() {
   if (!kw.value || searchState.value.loading) return;
   loadSettings();
   const keyword = kw.value.trim();
-  recordHotSearch(keyword);
+  // 搜索词由后端 search 接口自动记录（见 server/utils/recordSearchTerm.ts），前端不再上报
   // 同步搜索词到 URL
   if (router) {
     router.replace({ query: { q: keyword } });
   }
   await performSearch({
     ...getSearchOptions(),
-    onAuthRequired: requestUnlock ?? undefined,
+    onAuthRequired: handleAuthRequired,
   });
 }
 
-// 搜索执行
-async function onSearch() {
-  if (!kw.value || searchState.value.loading) return;
+// 搜索接口返回 401 时回调（2026-08-22）：
+// 服务端 requireWxAuth 实时校验失败（token 失效/取消关注）→ 强制重新吊起
+// 微信认证弹窗，认证成功后再重试搜索；密码门未解锁则走密码门。
+let wxAuthRetrying = false;
+async function handleAuthRequired() {
   if (auth.locked.value && requestUnlock) {
     requestUnlock(doSearch);
     return;
   }
-  // 微信公众号认证（前3次免费，之后弹窗，不阻塞搜索）
-  checkSearchAuth();
+  // 防止一次搜索并发多个子请求同时触发多次弹窗
+  if (wxAuthRetrying) return;
+  wxAuthRetrying = true;
+  try {
+    // 强制重新认证（重置 isVerified，重新弹关注公众号弹窗）
+    const ok = await forceVerify();
+    if (ok) {
+      resetSearch();
+      await doSearch();
+    }
+  } finally {
+    wxAuthRetrying = false;
+  }
+}
+
+// 搜索执行
+async function onSearch() {
+  if (!kw.value) return;
+  // 暂停状态下发起新搜索：放弃旧任务重新开始（想继续旧搜索请点"继续"按钮）
+  if (searchState.value.paused) {
+    resetSearch();
+  }
+  if (searchState.value.loading) return;
+  if (auth.locked.value && requestUnlock) {
+    requestUnlock(doSearch);
+    return;
+  }
+  // 微信公众号认证（强制：未认证先完成关注+验证码验证，成功后自动继续搜索）
+  const authed = await checkSearchAuth();
+  if (!authed) return;
   await doSearch();
 }
 
@@ -332,7 +363,7 @@ async function handleContinueSearch() {
       loadSettings();
       await continueSearch({
         ...getSearchOptions(),
-        onAuthRequired: requestUnlock ?? undefined,
+        onAuthRequired: handleAuthRequired,
       });
     });
     return;
@@ -340,7 +371,7 @@ async function handleContinueSearch() {
   loadSettings();
   await continueSearch({
     ...getSearchOptions(),
-    onAuthRequired: requestUnlock ?? undefined,
+    onAuthRequired: handleAuthRequired,
   });
 }
 

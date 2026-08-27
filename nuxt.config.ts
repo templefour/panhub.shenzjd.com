@@ -4,6 +4,7 @@ import channelsConfig from "./config/channels.json";
 export default defineNuxtConfig({
   compatibilityDate: "2025-07-15",
   devtools: { enabled: false },
+  css: ["~/assets/css/admin-shared.css"],
   devServer: {
     port: 4000,
   },
@@ -21,7 +22,7 @@ export default defineNuxtConfig({
         {
           name: "description",
           content:
-            "PanHub：聚合阿里云盘、夸克、百度网盘、115、迅雷等平台的全网最全网盘搜索工具，实时检索分享资源，免费、快速、无广告。",
+            "PanHub：聚合阿里云盘、夸克、百度网盘、115、迅雷等平台的全网最全网盘搜索工具，实时检索分享资源，快速、高效。",
         },
         {
           name: "keywords",
@@ -42,12 +43,29 @@ export default defineNuxtConfig({
   routeRules: {
     // 热搜接口不缓存，否则 POST 写入后 GET 仍返回旧数据
     "/api/hot-searches": { swr: false, cache: false },
+    // 热搜日历含"今日搜索次数"等实时统计，禁缓存避免滞后
+    "/api/hot-calendar": { swr: false, cache: false },
     // 豆瓣热搜允许短时缓存（服务端已有 60 分钟 cache）
     "/api/douban-hot": { swr: false, cache: false },
     // 密码门接口不缓存，确保 POST body 正常处理
     "/api/auth/**": { swr: false, cache: false },
     // 搜索接口依赖 Cookie 鉴权，禁止缓存避免 401 被缓存
     "/api/search": { swr: false, cache: false },
+    // SSE 搜索流（2026-08-24 架构改造）：长连接逐批推送，禁止缓存
+    // （默认 /** swr:3600 会把流缓存成 204 空响应）
+    "/api/search.stream": { swr: false, cache: false },
+    // 搜索明细管理查询（2026-08-25）：敏感数据 + 需实时看到新增记录，禁缓存
+    "/api/search-log": { swr: false, cache: false },
+    // IP 黑名单管理查询（2026-08-25）：同样禁缓存——
+    // ⚠️ 漏加此条曾导致首次 401 被 /** swr:3600 缓存 1 小时，之后请求
+    // 到不了后端，用户有 token 也永远 401（管理页看不到 userinfo 调用）
+    "/api/blacklist": { swr: false, cache: false },
+    // 管理后台频道接口（2026-08-26）：同样禁缓存——
+    // ⚠️ 与 blacklist 同坑：首次无 cookie 的 401 被 /** swr:3600 缓存，
+    // 用户登录后仍命中缓存 401（"明明登录了却说没登录"）。
+    // 管理员登录态（wxauth-token cookie）本身就是每请求必读的，
+    // 任何缓存都会把"未登录的错误响应"或"登录前的旧响应"复用。
+    "/api/admin/**": { swr: false, cache: false },
     // 链接检测接口需要读 POST body，禁止缓存避免 body 被中间件消费
     "/api/check": { swr: false, cache: false },
     // 图片代理依赖豆瓣，禁止 SWR 缓存避免错误响应被缓存
@@ -57,8 +75,9 @@ export default defineNuxtConfig({
   runtimeConfig: {
     // server-only 配置
     searchPassword: process.env.SEARCH_PASSWORD || "",
-    priorityChannels: channelsConfig.priorityChannels,
-    defaultChannels: channelsConfig.defaultChannels,
+    // 2026-08-24：频道清单已从仓库/配置移除，改由 ChannelConfigService
+    // 从 Turso 加密表拉取（见 server/core/services/channelConfigService.ts），
+    // 不再注入 runtimeConfig；前端经 /api/channels 下发获取。
     defaultConcurrency: channelsConfig.defaultConcurrency,
     pluginTimeoutMs: channelsConfig.pluginTimeoutMs,
     cacheEnabled: true,
@@ -66,8 +85,9 @@ export default defineNuxtConfig({
     public: {
       apiBase: "/api",
       siteUrl: "https://panhub.shenzjd.com",
-      // 向前端暴露默认频道清单
-      tgDefaultChannels: channelsConfig.defaultChannels,
+      // 2026-08-26：微信认证已写死强制（无开关）——不再有 wxAuthEnforce/
+      // NUXT_PUBLIC_WX_AUTH_ENFORCE 配置项。前端 useWxAuth 恒 required，
+      // 后端 requireWxAuth 恒拦截（详见两处代码注释）。
     },
   },
 });

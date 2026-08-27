@@ -1,4 +1,5 @@
 import { SearchService, type SearchServiceOptions } from "./searchService";
+import { getChannelConfigService } from "./channelConfigService";
 import {
   PluginManager,
   registerGlobalPlugin,
@@ -24,8 +25,6 @@ import { MelostPlugin } from "../plugins/melost";
 import { Quark4kPlugin } from "../plugins/quark4k";
 import { OugePlugin } from "../plugins/ouge";
 import { WanouPlugin } from "../plugins/wanou";
-import { YunsoPlugin } from "../plugins/yunso";
-import { U3c3Plugin } from "../plugins/u3c3";
 import { DyyjvPlugin } from "../plugins/dyyjv";
 
 const SERVICE_CONTEXT_KEY = "__panhub_search_service__";
@@ -57,8 +56,11 @@ function createPluginManager(): PluginManager {
   safeRegister("quark4k", () => new Quark4kPlugin());
   safeRegister("ouge", () => new OugePlugin());
   safeRegister("wanou", () => new WanouPlugin());
-  safeRegister("yunso", () => new YunsoPlugin());
-  safeRegister("u3c3", () => new U3c3Plugin());
+  // 2026-08-27 移除 yunso / u3c3：
+  // - yunso：上游 wd 参数失效（搜任何词返回同一批固定推荐列表，与搜索词完全
+  //   无关），被汇总层相关性过滤兜底后等效 0 结果，保留只会白消耗超时等待
+  // - u3c3：纯磁力种子站，产品要求搜索结果不出现磁力链接（同 nyaa /
+  //   solidtorrents / torrentgalaxy / x1337x 的处理），整站无网盘链接无保留价值
   // 2026-08-07 新增：dyyjv（电影云集，WordPress REST API，详情页内嵌夸克/百度链接）
   safeRegister("dyyjv", () => new DyyjvPlugin());
   pm.registerAllGlobalPlugins();
@@ -67,11 +69,17 @@ function createPluginManager(): PluginManager {
 
 /**
  * 创建搜索服务选项
+ *
+ * 2026-08-24：频道清单不再来自 runtimeConfig（明文已从仓库移除），
+ * 改由 ChannelConfigService 提供（Turso 加密存储 → 解密缓存快照）。
+ * 调用方（搜索 API 入口）应先 await getChannelConfigService().ensureLoaded()，
+ * 保证首次请求时快照已就绪；未加载时返回空数组，由隔离闸 B 降级。
  */
 function createServiceOptions(runtimeConfig: any): SearchServiceOptions {
+  const channelSnapshot = getChannelConfigService().getSnapshot();
   return {
-    priorityChannels: runtimeConfig.priorityChannels || [],
-    defaultChannels: runtimeConfig.defaultChannels || [],
+    priorityChannels: channelSnapshot.priorityChannels,
+    defaultChannels: channelSnapshot.defaultChannels,
     defaultConcurrency: runtimeConfig.defaultConcurrency || 10,
     pluginTimeoutMs: runtimeConfig.pluginTimeoutMs || 15000,
     cacheEnabled: !!runtimeConfig.cacheEnabled,
