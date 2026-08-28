@@ -33,7 +33,13 @@ export default defineNuxtConfig({
         { property: "og:type", content: "website" },
         { property: "og:site_name", content: "PanHub" },
       ],
-      link: [{ rel: "icon", type: "image/x-icon", href: "/favicon.ico" }],
+      link: [
+        {
+          rel: "icon",
+          type: "image/svg+xml",
+          href: "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-151509-5bk7.svg",
+        },
+      ],
     },
   },
   nitro: {
@@ -47,8 +53,6 @@ export default defineNuxtConfig({
     "/api/hot-calendar": { swr: false, cache: false },
     // 豆瓣热搜允许短时缓存（服务端已有 60 分钟 cache）
     "/api/douban-hot": { swr: false, cache: false },
-    // 密码门接口不缓存，确保 POST body 正常处理
-    "/api/auth/**": { swr: false, cache: false },
     // 搜索接口依赖 Cookie 鉴权，禁止缓存避免 401 被缓存
     "/api/search": { swr: false, cache: false },
     // SSE 搜索流（2026-08-24 架构改造）：长连接逐批推送，禁止缓存
@@ -70,11 +74,11 @@ export default defineNuxtConfig({
     "/api/check": { swr: false, cache: false },
     // 图片代理依赖豆瓣，禁止 SWR 缓存避免错误响应被缓存
     "/api/img": { swr: false, cache: false },
+    // 小程序登录接口（2026-08-28）：POST 写入 + 敏感凭证，禁缓存
+    "/api/mp/**": { swr: false, cache: false },
     "/**": { swr: 3600 },
   },
   runtimeConfig: {
-    // server-only 配置
-    searchPassword: process.env.SEARCH_PASSWORD || "",
     // 2026-08-24：频道清单已从仓库/配置移除，改由 ChannelConfigService
     // 从 Turso 加密表拉取（见 server/core/services/channelConfigService.ts），
     // 不再注入 runtimeConfig；前端经 /api/channels 下发获取。
@@ -88,6 +92,10 @@ export default defineNuxtConfig({
       // 2026-08-26：微信认证已写死强制（无开关）——不再有 wxAuthEnforce/
       // NUXT_PUBLIC_WX_AUTH_ENFORCE 配置项。前端 useWxAuth 恒 required，
       // 后端 requireWxAuth 恒拦截（详见两处代码注释）。
+      // 2026-08-28：认证统一收敛到 wx-auth 服务（唯一登录通道）：
+      // 小程序 Bearer token 由 wx-auth /api/auth/mp-login 签发，网页端
+      // 公众号 cookie 由 wx-auth-sdk 种下，panhub 只做转发校验
+      // （server/utils/wxAuthCheck.ts），不再持有微信密钥/自建登录。
     },
   },
 });

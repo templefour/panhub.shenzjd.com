@@ -126,18 +126,39 @@
     <!-- 空状态：仅当搜索完全结束且无结果时显示，搜索进行中不显示 -->
     <section v-else-if="searched && !searchState.loading && !searchState.deepLoading && !searchState.paused" class="empty-state">
       <div class="empty-card">
-        <div class="empty-icon">🔍</div>
-        <h3>未找到相关资源</h3>
-        <p>试试其他关键词，或稍后再试</p>
+        <div class="empty-card__main">
+          <div class="empty-icon" aria-hidden="true">
+            <svg
+              width="44"
+              height="44"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8" />
+              <path d="m21 21-4.3-4.3" />
+              <path d="m8.5 8.5 5 5" />
+              <path d="m13.5 8.5-5 5" />
+            </svg>
+          </div>
+          <div class="empty-card__text">
+            <h3>未找到相关资源</h3>
+            <p>试试其他关键词，或稍后再试</p>
+          </div>
+        </div>
         <div v-if="hotTerms.length > 0" class="empty-suggestions">
           <span class="empty-suggestions__label">大家都在搜：</span>
-          <button
-            v-for="term in hotTerms.slice(0, 5)"
-            :key="term"
-            class="empty-suggestions__tag"
-            @click="quickSearch(term)">
-            {{ term }}
-          </button>
+          <div class="empty-suggestions__tags">
+            <button
+              v-for="term in hotTerms.slice(0, 5)"
+              :key="term"
+              class="empty-suggestions__tag"
+              @click="quickSearch(term)">
+              {{ term }}
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -184,7 +205,10 @@ onMounted(async () => {
       kw.value = q; // 仍回填输入框，页面可读
     } else {
       kw.value = q;
-      await doSearch();
+      // 2026-08-28：必须走 onSearch（内部先 checkSearchAuth），不能直接
+      // doSearch——否则 URL 带 ?q= 时绕过公众号认证，无凭证真人会拿到
+      // 蜜罐数据而非弹出认证弹窗（与用户手动搜索行为一致）。
+      await onSearch();
     }
   }
   if (doubanHotRef.value) await doubanHotRef.value.init();
@@ -202,12 +226,14 @@ useSeoMeta({
     "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，快速、高效。",
   ogType: "website",
   ogSiteName: "PanHub",
-  ogImage: siteUrl ? `${siteUrl}/og.svg` : "/og.svg",
+  ogImage:
+    "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-151509-5bk7.svg",
   twitterCard: "summary_large_image",
   twitterTitle: "PanHub - 全网最全的网盘搜索",
   twitterDescription:
     "聚合阿里云盘、夸克、百度网盘、115、迅雷等平台，实时检索各类分享链接与资源，快速、高效。",
-  twitterImage: siteUrl ? `${siteUrl}/og.svg` : "/og.svg",
+  twitterImage:
+    "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-151509-5bk7.svg",
 });
 
 useHead({
@@ -274,9 +300,7 @@ const {
   autoPausedAtLimit,
 } = useSearch();
 const { settings, loadSettings } = useSettings();
-const auth = useAuth();
 const { checkSearchAuth, forceVerify } = useWxAuth();
-const requestUnlock = inject<(onSuccess?: () => void) => void>("requestUnlock");
 
 // 获取搜索选项（使用最新的用户设置）
 function getSearchOptions() {
@@ -291,7 +315,7 @@ function getSearchOptions() {
   };
 }
 
-// 执行实际搜索逻辑（供 requestUnlock 回调复用）
+// 执行实际搜索逻辑
 async function doSearch() {
   if (!kw.value || searchState.value.loading) return;
   loadSettings();
@@ -308,14 +332,10 @@ async function doSearch() {
 }
 
 // 搜索接口返回 401 时回调（2026-08-22）：
-// 服务端 requireWxAuth 实时校验失败（token 失效/取消关注）→ 强制重新吊起
-// 微信认证弹窗，认证成功后再重试搜索；密码门未解锁则走密码门。
+// 服务端 requireWxAuth 实时校验 token 失效/取消关注 → 强制重新吊起
+// 微信认证弹窗，认证成功后再重试搜索。
 let wxAuthRetrying = false;
 async function handleAuthRequired() {
-  if (auth.locked.value && requestUnlock) {
-    requestUnlock(doSearch);
-    return;
-  }
   // 防止一次搜索并发多个子请求同时触发多次弹窗
   if (wxAuthRetrying) return;
   wxAuthRetrying = true;
@@ -339,10 +359,6 @@ async function onSearch() {
     resetSearch();
   }
   if (searchState.value.loading) return;
-  if (auth.locked.value && requestUnlock) {
-    requestUnlock(doSearch);
-    return;
-  }
   // 微信公众号认证（强制：未认证先完成关注+验证码验证，成功后自动继续搜索）
   const authed = await checkSearchAuth();
   if (!authed) return;
@@ -358,16 +374,6 @@ async function quickSearch(keyword: string) {
 // 继续搜索（从暂停处继续）
 async function handleContinueSearch() {
   if (!searchState.value.paused) return;
-  if (auth.locked.value && requestUnlock) {
-    requestUnlock(async () => {
-      loadSettings();
-      await continueSearch({
-        ...getSearchOptions(),
-        onAuthRequired: handleAuthRequired,
-      });
-    });
-    return;
-  }
   loadSettings();
   await continueSearch({
     ...getSearchOptions(),
@@ -877,35 +883,59 @@ function visibleSorted(items: any[]) {
 .empty-state {
   display: flex;
   justify-content: center;
-  align-items: center;
-  padding: 48px 24px;
+  align-items: stretch;
+  padding: 32px 0;
   animation: fadeIn 0.4s ease;
 }
 
 .empty-card {
+  width: 100%;
   background: var(--bg-glass);
   backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.35);
   border-radius: var(--radius-xl);
-  padding: 32px;
-  text-align: center;
-  max-width: 400px;
-  box-shadow: var(--shadow-lg);
+  padding: 40px 44px;
+  box-shadow: var(--shadow-xl);
+  display: flex;
+  align-items: center;
+  gap: 40px;
+  flex-wrap: wrap;
+}
+
+.empty-card__main {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  min-width: 280px;
+  flex: 1 1 320px;
 }
 
 .empty-icon {
-  font-size: 48px;
-  margin-bottom: 16px;
-  opacity: 0.6;
+  flex-shrink: 0;
+  width: 88px;
+  height: 88px;
+  border-radius: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.6) 0%,
+    rgba(255, 255, 255, 0.2) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  color: var(--primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
 }
 
-.empty-card h3 {
+.empty-card__text h3 {
   margin: 0 0 8px 0;
-  font-size: 20px;
+  font-size: 22px;
+  font-weight: 600;
   color: var(--text-primary);
 }
 
-.empty-card p {
+.empty-card__text p {
   margin: 0;
   font-size: 14px;
   color: var(--text-secondary);
@@ -913,20 +943,27 @@ function visibleSorted(items: any[]) {
 }
 
 .empty-suggestions {
-  margin-top: 16px;
+  flex: 1 1 320px;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  justify-content: center;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  border-left: 1px solid var(--border-light);
+  padding-left: 40px;
 }
 .empty-suggestions__label {
   font-size: 13px;
+  font-weight: 500;
   color: var(--text-tertiary);
 }
+.empty-suggestions__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
 .empty-suggestions__tag {
-  font-size: 13px;
-  padding: 4px 12px;
+  font-size: 14px;
+  padding: 6px 16px;
   border-radius: 999px;
   border: 1px solid var(--border-light);
   background: var(--bg-secondary);
@@ -937,6 +974,8 @@ function visibleSorted(items: any[]) {
 .empty-suggestions__tag:hover {
   border-color: var(--primary);
   color: var(--primary);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.06);
 }
 
 /* 错误提示 */
@@ -1044,15 +1083,39 @@ function visibleSorted(items: any[]) {
   }
 
   .empty-card {
-    padding: 24px;
+    padding: 24px 20px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+  }
+
+  .empty-card__main {
+    min-width: 0;
+    width: 100%;
+    gap: 16px;
   }
 
   .empty-icon {
-    font-size: 36px;
+    width: 64px;
+    height: 64px;
+    border-radius: 18px;
+  }
+
+  .empty-icon svg {
+    width: 36px;
+    height: 36px;
   }
 
   .empty-card h3 {
     font-size: 18px;
+  }
+
+  .empty-suggestions {
+    width: 100%;
+    border-left: none;
+    padding-left: 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-light);
   }
 
   .suggestions-card {

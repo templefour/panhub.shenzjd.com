@@ -33,8 +33,6 @@
 `/api/search`（GET/POST）入口最前：
 
 ```
-requireSearchAuth (密码门)
-  ↓
 isBlocked(ip)?    ← posCache(5min) → negCache(30s) → Turso
   ↓ 是             命中 → 403 "ip blocked"（连 UA 校验都跳过）
   ↓ 否
@@ -103,8 +101,45 @@ DELETE FROM rejected_ips WHERE ip = '1.2.3.4';
 
 - 未关注公众号的真人用户直接 401，体验影响大（这是产品设计，不是 bug）
 - fork 站在自己域名完成一次关注+验证码后，cookie 写在自己域名（1 年有效），后续搜索静默放行、不再弹
-- API Key 持有者（小程序 / 已授权 client）不受影响（`requireAuth` 有 Bearer/client-secret 放行）
+- 小程序与网页端统一走 wx-auth 认证（见下方"小程序登录"章节）：小程序带 `Authorization: Bearer <wx-auth token>`，`requireWxAuth` 转发 wx-auth `/api/auth/check` 校验，有效放行、无效 401
 - **wx-auth 服务故障 → fail-closed（拒绝）**：宁可误伤，不裸奔（2026-08-26 用户拍板，之前是降级放行）
+
+## 小程序登录（2026-08-28 起统一走 wx-auth）
+
+### 背景
+
+公众号 openid 与小程序 openid 不是同一个（个人订阅号未认证，拿不到 unionid），无法打通。最初 panhub 自建了一套小程序登录（`/api/mp/login` code2session 换 openid + 本地 `mp_token` 表签发 Bearer token），2026-08-28 下线，登录统一收敛到 wx-auth 服务（全站唯一登录通道），panhub 不再持有微信密钥、不再自签 token。
+
+### 流程
+
+```
+小程序 wx.login() → code
+  ↓ POST https://wx-auth.shenzjd.com/api/auth/mp-login { code }
+wx-auth 用小程序 appid+secret 调微信 code2session → openid
+  ↓ wx-auth 签发 token（身份 mp:<openid>，active=true）
+返回 { token, openid }
+  ↓
+小程序后续请求带 Authorization: Bearer <token>
+  ↓ requireWxAuth → wxAuthCheck 转发 wx-auth /api/auth/check（10min 缓存）
+authenticated=true → 放行（user.mpOpenid 即本地 mp_user 表的 key）
+authenticated=false → 401（小程序端清 token 重新走 mp-login）
+```
+
+### 环境变量
+
+```bash
+# wx-auth 认证服务地址（小程序 Bearer 与网页端 cookie 均转发该校验）
+WX_AUTH_API_BASE=https://wx-auth.shenzjd.com
+```
+
+（小程序的 MP_APPID / MP_SECRET 已迁到 wx-auth 项目配置，panhub 不再需要。）
+
+### 安全设计
+
+- **登录权威在 wx-auth**：token 由 wx-auth 签发/吊销，panhub 只做转发校验，无本地凭证存储（原 `mp_token` 表已废弃，可择期清理）
+- **fail-closed**：wx-auth 不可达/超时/非 2xx → 拒绝，不降级放行
+- **10min 跨请求缓存**：同一 token 短 TTL 内不重复打远程（含 false 结果；缓存条目带 user 身份，profile 接口复用）
+- 用户资料（昵称/头像）仍存本项目 `mp_user` 表，key 为 wx-auth check 返回的 `user.mpOpenid`
 
 ### ⚠️ 上线前必做：本地验证手册
 
@@ -147,9 +182,10 @@ curl -i 'http://localhost:4000/api/search?kw=凡人修仙传'
 curl -i -H "Cookie: wxauth-token=garbage" \
   'http://localhost:4000/api/search?kw=凡人修仙传'
 
-# D. Bearer 凭证（小程序）→ 应 200（已授权 client 不受 wxauth 影响）
-curl -i -H 'Authorization: Bearer dev-bearer' \
+# D. Bearer 凭证（小程序，wx-auth /api/auth/mp-login 签发）→ 需有效 token 才 200
+curl -i -H 'Authorization: Bearer <有效token>' \
   'http://localhost:4000/api/search?kw=凡人修仙传'
+#    无效 token → 401（不再像以前随便填就放行）
 ```
 
 **预期**：A=D=200 且有搜索结果，B=C=401。如果 A 失败 → 调 mock 白名单 + 确认 `WX_AUTH_API_BASE` 指向 mock，调查通过路径。
