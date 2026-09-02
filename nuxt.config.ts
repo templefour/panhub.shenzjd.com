@@ -4,7 +4,18 @@ import channelsConfig from "./config/channels.json";
 export default defineNuxtConfig({
   compatibilityDate: "2025-07-15",
   devtools: { enabled: false },
-  css: ["~/assets/css/admin-shared.css"],
+  // admin-shared.css 只在 layouts/admin.vue 里按需引入（admin 专属），
+  // 不再全局注入——普通用户访问客户端页面不加载任何 admin 代码与样式
+  // 2026-09-01 后台管理接入 TDesign（tdesign.tencent.com）：
+  // 官方 Nuxt 模块，自动按需导入组件/图标/CSS 变量，SSR 友好。
+  // 组件按 t- 前缀解析，客户端页面未使用 t- 组件，不增加客户端包体。
+  modules: ["@tdesign-vue-next/nuxt"],
+  tdesign: {
+    // 关掉模块的全局样式注入：es/style/index.css（token + 基础 reset，约 19KB）
+    // 会进 nuxt.options.css 全局数组，客户端页面也会下载。
+    // 改由 layouts/admin.vue 自行 import，只随 /admin 路由加载。
+    importVariables: false,
+  },
   devServer: {
     port: 4000,
   },
@@ -49,8 +60,12 @@ export default defineNuxtConfig({
   routeRules: {
     // 热搜接口不缓存，否则 POST 写入后 GET 仍返回旧数据
     "/api/hot-searches": { swr: false, cache: false },
-    // 热搜日历含"今日搜索次数"等实时统计，禁缓存避免滞后
-    "/api/hot-calendar": { swr: false, cache: false },
+    // 首页统计带（2026-09-01 替代 hot-calendar 的页头指标）：走 service 层
+    // TTL 读缓存，路由层禁缓存保证数字不被 SWR 固化 1 小时
+    "/api/hot-stats": { swr: false, cache: false },
+    // /hot 每日榜单页已下线（2026-09-01：公开页不再展示搜索词），
+    // 已收录链接 301 回首页，权重不丢
+    "/hot": { redirect: { to: "/", statusCode: 301 } },
     // 豆瓣热搜允许短时缓存（服务端已有 60 分钟 cache）
     "/api/douban-hot": { swr: false, cache: false },
     // 搜索接口依赖 Cookie 鉴权，禁止缓存避免 401 被缓存

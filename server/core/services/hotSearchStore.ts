@@ -13,6 +13,19 @@ export interface IHotSearchStore {
   recordSearch(term: string, now: number, delta?: number): Promise<void>;
 
   /**
+   * 批量落盘一批词增量（flush 用，2026-09-01 新增）
+   * 实现方应合并为单次 batch 往返（libsql client.batch），替代逐词 execute。
+   * @param entries 已按词聚合的增量列表（term 已规范化）
+   */
+  recordSearchBatch(entries: { term: string; lastAt: number; delta: number }[]): Promise<void>;
+
+  /**
+   * 批量累加多天的搜索次数（flush 用，2026-09-01 新增）
+   * 实现方应合并为单次 batch 往返。
+   */
+  recordDailySearchesBatch(entries: { date: string; delta: number }[]): Promise<void>;
+
+  /**
    * 获取热搜列表
    */
   getHotSearches(limit: number): Promise<HotSearchItem[]>;
@@ -79,7 +92,7 @@ export interface IHotSearchStore {
    * 一次 batch 查日历页头三件套：totalTerms（总词数 COUNT(*)）、
    * totalSearches（总次数 SUM(count)）、dailyDayCount（有次数记录的天数）
    * （2026-08-30 扩展：原 totalTerms + dailyDayCount 两查合并 batch 的基础上，
-   * 再并入总搜索次数，hot-calendar 一次往返拿全页头指标）
+   * 再并入总搜索次数，hot-stats 一次往返拿全统计带指标）
    */
   getCalendarMeta(): Promise<{
     totalTerms: number;
