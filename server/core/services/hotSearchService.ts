@@ -23,6 +23,13 @@ const FLUSH_INTERVAL_MS =
  */
 const READ_TTL_FAST_MS = Number(process.env.HOT_SEARCH_READ_TTL_MS) || 60_000;
 const READ_TTL_SLOW_MS = 5 * 60_000;
+/**
+ * 首页"昨日结算数据"日缓存 TTL（2026-09-03 用户拍板：单 Docker 场景下
+ * 大幅削减 Turso 读配额）。首页统计带/词云展示"昨天"的最终态数字与词池，
+ * 昨天数据恒定不变，故缓存 key 拼上昨日日期 + 25h TTL → 每个数字每天只读
+ * 一次库（今日首次访问触发），跨天自然因 key 变化而刷新，无定时器依赖。
+ */
+const HOME_DAY_CACHE_TTL_MS = 25 * 60 * 60_000;
 /** 读缓存容量上限（防内存无限增长，超限先清过期条目） */
 const READ_CACHE_MAX = 500;
 
@@ -54,6 +61,8 @@ export class HotSearchService {
   private flushing: Promise<void> | null = null;
   /** 读缓存（方法+参数 → 结果，TTL 过期自动刷新） */
   private readCache = new Map<string, ReadCacheEntry>();
+  /** in-flight 去重：同 key 并发未命中复用同一 fetch Promise（防缓存击穿） */
+  private inflightFetches = new Map<string, Promise<unknown>>();
 
   constructor() {
     this.initPromise = this.initialize();
@@ -100,6 +109,10 @@ export class HotSearchService {
   /**
    * 读缓存包装（2026-08-24）：TTL 内命中直接返回，避免每次请求查库。
    * 容量保护：超上限时先清过期条目，仍超则淘汰最旧一条（防止缓存无限膨胀）。
+   *
+   * 2026-09-03 新增 in-flight 去重（防缓存击穿）：TTL 到期瞬间并发请求
+   * 都会未命中，各自 fetcher 同时查库（CF Worker 冷启动 isolate 频繁回收
+   * 场景下更明显）。现同 key 并发复用同一个 Promise，N 个并发只查库 1 次。
    */
   private async getCached<T>(
     key: string,
@@ -110,20 +123,31 @@ export class HotSearchService {
     if (hit && hit.expires > Date.now()) {
       return hit.value as T;
     }
-    const value = await fetcher();
-    if (this.readCache.size >= READ_CACHE_MAX) {
-      const now = Date.now();
-      for (const [k, v] of this.readCache) {
-        if (v.expires <= now) this.readCache.delete(k);
-      }
+    const inflight = this.inflightFetches.get(key);
+    if (inflight) return (await inflight) as T;
+
+    const p = (async () => {
+      const value = await fetcher();
       if (this.readCache.size >= READ_CACHE_MAX) {
-        // 仍满：淘汰最早过期的一条（Map 按插入序迭代）
-        const oldestKey = this.readCache.keys().next().value as string | undefined;
-        if (oldestKey) this.readCache.delete(oldestKey);
+        const now = Date.now();
+        for (const [k, v] of this.readCache) {
+          if (v.expires <= now) this.readCache.delete(k);
+        }
+        if (this.readCache.size >= READ_CACHE_MAX) {
+          // 仍满：淘汰最早过期的一条（Map 按插入序迭代）
+          const oldestKey = this.readCache.keys().next().value as string | undefined;
+          if (oldestKey) this.readCache.delete(oldestKey);
+        }
       }
+      this.readCache.set(key, { value, expires: Date.now() + ttlMs });
+      return value;
+    })();
+    this.inflightFetches.set(key, p);
+    try {
+      return await p;
+    } finally {
+      this.inflightFetches.delete(key);
     }
-    this.readCache.set(key, { value, expires: Date.now() + ttlMs });
-    return value;
   }
 
   /** 清空全部读缓存（delete/clear 后调用，保证删后立即可见） */
@@ -186,16 +210,23 @@ export class HotSearchService {
       }
       // 2026-09-01 优化：词表与每日次数各一次 batch 往返（原逐词 await，
       // 100 词的 flush = 100+ 次 HTTP 往返）
-      await store.recordSearchBatch(
+      // 2026-09-03 优化读量：recordSearchBatch 返回本批新增词数，
+      // recordDailySearchesBatch 同批累计 total_searches——两个计数器
+      // 让 getCalendarMeta 只读几行，不再全表 COUNT(*)/SUM(count)
+      const newTerms = await store.recordSearchBatch(
         [...snapshot.entries()].map(([term, p]) => ({
           term,
           lastAt: p.lastAt,
           delta: p.delta,
         }))
       );
-      await store.recordDailySearchesBatch(
-        [...dailyDelta.entries()].map(([date, delta]) => ({ date, delta }))
-      );
+      const counterWrites: Promise<void>[] = [
+        store.recordDailySearchesBatch(
+          [...dailyDelta.entries()].map(([date, delta]) => ({ date, delta }))
+        ),
+      ];
+      if (newTerms > 0) counterWrites.push(store.incrementTotalTerms(newTerms));
+      await Promise.all(counterWrites);
       // 2026-09-01 优化：flush 不再清任何读缓存，全部交给 TTL 过期自然刷新。
       // 原实现每次 flush 清 calendar/day/daily 缓存，活跃站点 60s flush 一次，
       // hot 页 5min TTL 形同虚设、几乎每次进页都真查库；不清后页头/列表/日历
@@ -274,6 +305,72 @@ export class HotSearchService {
       this.requireStore().getRandomHotSearches(canonical)
     );
     return pool.slice(0, limit);
+  }
+
+  /**
+   * 首页"昨日结算数据"（2026-09-03 用户拍板：压减 Turso 读配额到每天一次）
+   *
+   * 首页词云 + 统计带改为展示**昨天**的最终态数据（昨天已结束，值恒定，
+   * 与"今天实时涨"的旧口径不同），配合日期键缓存可做到：今日首次访问触发
+   * 一次查库，此后一整天命中内存缓存，跨天 key 变化自动刷新——**每个数字
+   * 每天只读一次库**，无需定时器，单 Docker 常驻下对读配额几乎零消耗。
+   *
+   * 返回（一次 fetch 内并发取齐，避免多次往返）：
+   * - yesterdayTerms   ：昨日被搜索过的去重词数（昨日词云词池大小）
+   * - yesterdaySearches：昨日真实搜索次数（daily_searches 精确记录，未记录为 0）
+   * - wordPool         ：昨日被搜词池（作为首页词云候选，随机取若干展示）
+   * - totalSearches / totalTerms：累计值（源自 stats_meta 计数器，几行读）
+   */
+  async getHomeYesterdayData(limit = 100): Promise<{
+    yesterdayTerms: number;
+    yesterdaySearches: number;
+    totalSearches: number;
+    totalTerms: number;
+    wordPool: { term: string; count: number }[];
+  }> {
+    await this.waitForInit();
+    // 昨日日期键（北京时间）；缓存 key 带它 → 每天自然只查一次。
+    // limit 只影响返回切片，不影响缓存内容（fetch 每次缓存满 100 词池，
+    // 由各调用方按需 slice），保证 hot-stats / hot-searches 共享同一缓存。
+    const yesterday = formatDateKey(Date.now() - 86400000);
+    const safe = Math.min(Math.max(1, limit), 100);
+    const poolSize = 100; // 缓存始终备足 100，供词云按 limit 切片
+    const cached = await this.getCached(`home_yesterday:${yesterday}`, HOME_DAY_CACHE_TTL_MS, async () => {
+      const store = this.requireStore();
+      // 并发取齐（getDayItems 昨日全量词单 / getDailySearches 昨日次数 /
+      // getCalendarMeta 累计计数）。词单为昨日最终态，行数=昨日词数，
+      // 一天一次读取，读配额可忽略。
+      const [dayItems, searches, meta] = await Promise.all([
+        store.getDayItems(yesterday),
+        store.getDailySearches(yesterday),
+        store.getCalendarMeta(),
+      ]);
+      // 词云候选池：昨日词先随机打散再取前 poolSize 个（词云随机展示语义），
+      // 每日首次触发随机一次并缓存一整天，跨天 key 变化再重新随机。
+      const shuffled = dayItems.slice();
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      const wordPool = shuffled.slice(0, poolSize).map((it) => ({
+        term: it.term,
+        count: it.count,
+      }));
+      return {
+        yesterdayTerms: dayItems.length,
+        yesterdaySearches: searches,
+        totalSearches: meta.totalSearches,
+        totalTerms: meta.totalTerms,
+        wordPool,
+      };
+    });
+    return {
+      yesterdayTerms: cached.yesterdayTerms,
+      yesterdaySearches: cached.yesterdaySearches,
+      totalSearches: cached.totalSearches,
+      totalTerms: cached.totalTerms,
+      wordPool: cached.wordPool.slice(0, safe),
+    };
   }
 
   async clearHotSearches(): Promise<{ success: boolean; message: string }> {
@@ -410,6 +507,7 @@ export class HotSearchService {
     this.clearFlushTimer();
     this.pending.clear();
     this.readCache.clear();
+    this.inflightFetches.clear();
     this.store?.close();
   }
 }

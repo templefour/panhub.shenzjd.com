@@ -85,9 +85,33 @@ DELETE FROM rejected_ips WHERE ip = '1.2.3.4';
 
 24h 自动过期也可不管。
 
+#### 用户反馈"看到蜜罐数据" → openid 解封闭环（2026-09-03）
+
+**问题**：黑名单只按 IP 记。蜜罐拦截（`isBlocked`）发生在 `requireWxAuth` **之前**，被蜜罐的
+真人请求解不出 openid，且 `search_log` 只记成功放行的搜索——用户拿 openid 反馈时，
+后台没有任何 "该 openid 正在被哪个被封 IP 蜜罐" 的记录，无法定位也无法解封。
+
+**方案**（最小闭环 + 不增加热路径 DB 读）：
+1. 蜜罐命中时若请求带凭证，`maybeRecordHoneypotOpenid`（见 `server/utils/recordHoneypotOpenid.ts`）
+   fire-and-forget 解析 openid（复用 wx-auth 10min 内存缓存），把 `(openid, ip)` upsert 进
+   `honeypot_hits` 表（纯 DB **写**，只有被误伤的真人触发，量小）。
+   - 无凭证爬虫 → 同步短路，零远程零 DB
+2. 管理端黑名单面板「蜜罐反馈解封」：
+   - 按 openid 查 → `GET /api/blacklist-lookup?openid=xxx`（honeypot_hits 一次 +
+     rejected_ips 一次 IN 批量）→ 该 openid 最近命中过蜜罐的 IP + 各 IP 封禁状态
+   - 一键解封复用现有 `removeIp`（DELETE /api/blacklist?ip=）
+   - 按 IP 查 → `?ip=xxx` 可看该 IP 影响了哪些 openid
+
+**维护**：`honeypot_hits` 记录仅用于近期反馈，随 botDefense 周期 prune 清理（默认 90 天）。
+
 #### prune 策略
 
-`BotDefenseService.startMaintenance()` 每 5min 调一次 `pruneExpired`，自动清理 `expires_at <= now` 的条目。
+`BotDefenseService.startMaintenance()` 周期清理（2026-09-03 起为降 Turso 读量拆成三档定时器）：
+- 黑名单表 `pruneExpired`：每 **1h** 一次（原 5min），自动清理 `expires_at <= now` 且 `block_count = 0`
+  的计数短记录；`block_count > 0` 的惯犯档案保留。删除延迟一档不影响任何判定（`isBlocked`
+  只看 `block_count > 0`）。
+- 内存 pos/neg 缓存清扫：每 5min 一次，纯本地无 DB。
+- `honeypot_hits` 蜜罐命中清理：每 24h 一次（保留 90 天，低频即可）。
 
 ## 公众号登录强制认证（写死强制，无开关）
 
